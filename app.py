@@ -23,20 +23,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuración de clave API de Gemini
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
-# Estructura base en memoria
+# Base de datos en memoria (reflejo de tu PDF)
 DB = {
     "equipo": ["GERARDO", "CRIS", "MARIO", "HÉCTOR", "GRACIA", "INGRID", "JULIO"],
     "pendientes": [
         {"id": 1, "asignado_a": "GERARDO", "categoria": "TRABAJO", "descripcion": "Seguimiento Computadoras", "dias": "Hoy"},
-        {"id": 2, "asignado_a": "JULIO", "categoria": "TRABAJO", "descripcion": "Revisión de informes", "dias": "0d"}
+        {"id": 2, "asignado_a": "GERARDO", "categoria": "TRABAJO", "descripcion": "Ingresar Ticket ON Premise Demand", "dias": "Hoy"},
+        {"id": 16, "asignado_a": "CRIS", "categoria": "TRABAJO", "descripcion": "Reportes Migrar a ReportBuilder", "dias": "9d"},
+        {"id": 18, "asignado_a": "MARIO", "categoria": "TRABAJO", "descripcion": "Elga Incentivos", "dias": "Hoy"},
+        {"id": 24, "asignado_a": "JULIO", "categoria": "TRABAJO", "descripcion": "Revisión de informes", "dias": "0d"}
     ],
     "habitos": [
-        {"nombre": "Gimnasio", "registros": {"L": False, "Ma": True, "Mi": False, "J": False, "V": False, "S": False, "D": False}},
+        {"nombre": "Gimnasio", "registros": {"L": False, "Ma": False, "Mi": False, "J": False, "V": False, "S": False, "D": False}},
         {"nombre": "Lectura 15 min", "registros": {"L": False, "Ma": False, "Mi": False, "J": False, "V": False, "S": False, "D": False}},
         {"nombre": "Tenis", "registros": {"L": False, "Ma": False, "Mi": False, "J": False, "V": False, "S": False, "D": False}}
     ]
@@ -45,20 +47,20 @@ DB = {
 PROMPT_ANALISIS = """
 Analiza esta foto de una hoja impresa de pendientes y hábitos.
 1. COMPLETADOS: Identifica números/tareas marcados con tachón, X o check.
-2. NUEVAS TAREAS MANUSCRITAS: Busca notas a mano como '+ GERARDO tarea' o '+ JULIO informe'. Extrae la tarea y el asignado.
-3. HABIT TRACKER: Identifica qué días (L, Ma, Mi, J, V, S, D) están marcados en la matriz de hábitos.
+2. NUEVAS TAREAS MANUSCRITAS: Busca notas a mano (ej. '+ GERARDO tarea'). Extrae tarea y asignado. Si no hay asignado, es GERARDO.
+3. HABIT TRACKER: Identifica qué días están marcados.
 
 Devuelve ÚNICAMENTE un JSON válido (sin Markdown):
 {
   "completados_ids": [],
-  "nuevas_tareas": [{"asignado_a": "JULIO", "categoria": "TRABAJO", "descripcion": "Nueva tarea"}],
-  "habitos_marcados": {"Gimnasio": ["L", "Ma"]}
+  "nuevas_tareas": [{"asignado_a": "GERARDO", "categoria": "TRABAJO", "descripcion": "Nueva tarea detectada"}],
+  "habitos_marcados": {"Gimnasio": ["L"]}
 }
 """
 
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "Backend de Pendientes Operativo"}
+@app.get("/api/data")
+def get_data():
+    return DB
 
 @app.post("/procesar-hoja")
 async def procesar_hoja(file: UploadFile = File(...)):
@@ -72,13 +74,13 @@ async def procesar_hoja(file: UploadFile = File(...)):
         raw_text = response.text.strip().replace("```json", "").replace("```", "")
         resultado = json.loads(raw_text)
 
-        # 1. Eliminar completados
+        # Eliminar completados
         ids_comp = resultado.get("completados_ids", [])
         DB["pendientes"] = [p for p in DB["pendientes"] if p["id"] not in ids_comp]
 
-        # 2. Agregar nuevas tareas
+        # Agregar nuevas tareas
         for nt in resultado.get("nuevas_tareas", []):
-            nuevo_id = max([p["id"] for p in DB["pendientes"]], default=0) + 1
+            nuevo_id = max([p["id"] for p in DB["pendientes"]] + [0]) + 1
             DB["pendientes"].append({
                 "id": nuevo_id,
                 "asignado_a": nt.get("asignado_a", "GERARDO").upper(),
@@ -87,33 +89,19 @@ async def procesar_hoja(file: UploadFile = File(...)):
                 "dias": "0d"
             })
 
-        # 3. Actualizar hábitos
-        hab_marcados = resultado.get("habitos_marcados", {})
-        for hab in DB["habitos"]:
-            if hab["nombre"] in hab_marcados:
-                dias_activos = hab_marcados[hab["nombre"]]
-                for dia in ["L", "Ma", "Mi", "J", "V", "S", "D"]:
-                    if dia in dias_activos:
-                        hab["registros"][dia] = True
-
-        # Generar PDF actualizado
-        generar_pdf_file()
-
-        return {"status": "success", "data": resultado}
+        return {"status": "success", "data": DB}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def generar_pdf_file():
-    filename = "pendientes_actualizados.pdf"
+@app.get("/descargar-pdf")
+def descargar_pdf():
+    filename = "pendientes.pdf"
     doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
     styles = getSampleStyleSheet()
     story = []
-
-    title_style = ParagraphStyle('DocTitle', parent=styles['Heading1'], fontSize=16, textColor=colors.HexColor('#1A1A1A'))
-    fecha_str = datetime.date.today().strftime("%d.%m.%Y")
     
-    # Página 1: Pendientes
-    story.append(Paragraph(f"<b>GERARDO - Pendientes</b><br/><font size=9 color='#666666'>{fecha_str}</font>", title_style))
+    title_style = ParagraphStyle('DocTitle', parent=styles['Heading1'], fontSize=16, textColor=colors.HexColor('#1A1A1A'))
+    story.append(Paragraph("<b>GERARDO - Pendientes</b>", title_style))
     story.append(Spacer(1, 15))
 
     p_data = [["ID / Tarea", "Asignado", "Días"]]
@@ -124,38 +112,8 @@ def generar_pdf_file():
     t_pend.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#E5E7EB')),
         ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CCCCCC')),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
     ]))
     story.append(t_pend)
-
-    story.append(PageBreak())
-
-    # Página 2: Hábitos
-    story.append(Paragraph("<b>GERARDO - Hábitos</b>", title_style))
-    story.append(Spacer(1, 15))
-
-    h_data = [["Hábito", "L", "Ma", "Mi", "J", "V", "S", "D", "Semana"]]
-    for hab in DB["habitos"]:
-        r = hab["registros"]
-        comp = sum(1 for v in r.values() if v)
-        h_data.append([
-            hab["nombre"],
-            "✓" if r["L"] else "", "✓" if r["Ma"] else "", "✓" if r["Mi"] else "",
-            "✓" if r["J"] else "", "✓" if r["V"] else "", "✓" if r["S"] else "",
-            "✓" if r["D"] else "", f"{comp}/7"
-        ])
-
-    t_hab = Table(h_data, colWidths=[150] + [35]*7 + [50])
-    t_hab.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#E5E7EB')),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CCCCCC')),
-        ('ALIGN', (1,0), (-1,-1), 'CENTER'),
-    ]))
-    story.append(t_hab)
-
     doc.build(story)
-
-@app.get("/descargar-pdf")
-def descargar_pdf():
-    generar_pdf_file()
-    return FileResponse("pendientes_actualizados.pdf", media_type="application/pdf", filename="pendientes.pdf")
+    
+    return FileResponse(filename, media_type="application/pdf", filename="pendientes_actualizados.pdf")
