@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+google-generativeai
+pillow
+reportlab
+python-multipart
