@@ -38,6 +38,7 @@ class Tarea(Base):
     prioritaria = Column(Boolean, default=False)      # equivale a tu "★"
     revisar = Column(Boolean, default=False)          # equivale a tu "⚠"
     completada = Column(Boolean, default=False)
+    orden = Column(Integer, nullable=True)            # posición manual (None = usar el orden de creación)
     fecha_creada = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     fecha_completada = Column(DateTime, nullable=True)
 

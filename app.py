@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
+from sqlalchemy import inspect, text, func
 import google.generativeai as genai
 import json
 import os
@@ -33,9 +34,26 @@ def asegurar_habitos_base(db: Session):
     db.commit()
 
 
+def asegurar_columna_orden(engine):
+    """Migración mínima: agrega la columna 'orden' a la tabla tareas si la
+    base de datos ya existía de antes de este cambio. Base.metadata.create_all
+    solo crea tablas que faltan — NO altera tablas ya existentes — así que
+    para una base de datos en producción como esta hay que agregar la
+    columna a mano, una sola vez. Es seguro correr esto en cada arranque:
+    si la columna ya existe, no hace nada."""
+    inspector = inspect(engine)
+    if "tareas" not in inspector.get_table_names():
+        return
+    columnas = [c["name"] for c in inspector.get_columns("tareas")]
+    if "orden" not in columnas:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE tareas ADD COLUMN orden INTEGER"))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    asegurar_columna_orden(engine)
     db = next(get_db())
     try:
         asegurar_habitos_base(db)
@@ -98,7 +116,7 @@ def construir_estado(db: Session) -> EstadoCompleto:
     frontend siempre pinta desde el mismo contrato, y nunca se puede
     "perder" una tarea en pantalla por mostrar solo un fragmento.
     """
-    tareas = db.query(Tarea).filter(Tarea.completada == False).order_by(Tarea.fecha_creada).all()  # noqa: E712
+    tareas = db.query(Tarea).filter(Tarea.completada == False).order_by(func.coalesce(Tarea.orden, Tarea.id), Tarea.id).all()  # noqa: E712
 
     lunes = datetime.datetime.combine(inicio_semana_actual(), datetime.time.min)
     habitos_out = []
@@ -175,6 +193,25 @@ def crear_tarea_manual(nueva: NuevaTareaManual, db: Session = Depends(get_db)):
         descripcion=nueva.descripcion.strip(),
         prioritaria=nueva.prioritaria,
     ))
+    db.commit()
+    generar_pdf_file(db)
+    return construir_estado(db)
+
+
+class OrdenPayload(BaseModel):
+    orden_ids: list[int]
+
+
+@app.patch("/tareas/reordenar", response_model=EstadoCompleto)
+def reordenar_tareas(payload: OrdenPayload, db: Session = Depends(get_db)):
+    """Guarda un nuevo orden manual para un grupo de tareas (las de una
+    misma persona, o las de PERSONALES). Se le manda la lista completa de
+    ids de ESE grupo en el orden nuevo; cada una recibe su posición según
+    el índice en la lista. No afecta el orden de tareas de otros grupos."""
+    if not payload.orden_ids:
+        raise HTTPException(status_code=400, detail="La lista de orden no puede estar vacía.")
+    for idx, tarea_id in enumerate(payload.orden_ids):
+        db.query(Tarea).filter(Tarea.id == tarea_id).update({"orden": idx})
     db.commit()
     generar_pdf_file(db)
     return construir_estado(db)
@@ -341,7 +378,7 @@ def generar_pdf_file(db: Session):
     story = []
     fecha_str = datetime.date.today().strftime("%d.%m.%Y")
 
-    tareas = db.query(Tarea).filter(Tarea.completada == False).order_by(Tarea.fecha_creada).all()  # noqa: E712
+    tareas = db.query(Tarea).filter(Tarea.completada == False).order_by(func.coalesce(Tarea.orden, Tarea.id), Tarea.id).all()  # noqa: E712
 
     # Agrupar: cada persona del equipo con sus tareas de categoría TRABAJO,
     # más un grupo aparte "PERSONALES" con todas las tareas de esa categoría.
