@@ -351,7 +351,7 @@ def _construir_grupo_pdf(nombre, tareas, ancho):
             prefijo = '<font color="#B42318">! </font>'
         else:
             prefijo = ""
-        desc = Paragraph(f"{prefijo}{t.descripcion}", _desc_style)
+        desc = Paragraph(f'<font color="#AAAAAA" size="6.5">#{t.id}</font>  {prefijo}{t.descripcion}', _desc_style)
         bg, fg = _clase_edad_pdf(t.dias_pendiente)
         filas.append([desc, Paragraph(_texto_edad_pdf(t.dias_pendiente), _age_style), ""])
         estilos += [
