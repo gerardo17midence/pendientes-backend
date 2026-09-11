@@ -1,16 +1,15 @@
 """
 Schemas de Pydantic.
 
-Dos usos:
-1. Validar la respuesta de Gemini ANTES de tocar la base de datos
-   (si Gemini devuelve algo mal formado, esto lo detecta con un error
-   claro en vez de que el error explote a medio camino de actualizar
-   la base de datos).
+Tres usos:
+1. Validar la respuesta de Gemini ANTES de tocar la base de datos.
 2. Formatear las respuestas de la API hacia el frontend.
+3. Definir la forma de respuesta compartida entre /pendientes y
+   /procesar-hoja, para que el frontend siempre reciba el estado
+   COMPLETO persistido — nunca un fragmento parcial de una sola foto.
 """
 
-from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict
 from pydantic import BaseModel, Field, field_validator
 
 DIAS_VALIDOS = {"L", "Ma", "Mi", "J", "V", "S", "D"}
@@ -81,5 +80,14 @@ class HabitoOut(BaseModel):
 
 
 class EstadoCompleto(BaseModel):
+    """Estado completo del tablero: se usa como respuesta tanto de
+    GET /pendientes (carga inicial) como de POST /procesar-hoja
+    (después de aplicar los cambios de una foto). Así el frontend
+    SIEMPRE renderiza desde la misma forma de datos, ya persistidos
+    en la base de datos — nunca desde un fragmento parcial."""
     pendientes: List[TareaOut]
     habitos: List[HabitoOut]
+
+
+class ProcesarHojaResponse(EstadoCompleto):
+    status: str = "success"

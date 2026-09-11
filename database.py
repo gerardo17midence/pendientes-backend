@@ -26,9 +26,10 @@ if not DATABASE_URL:
     )
 
 # Supabase/Neon normalmente ya incluyen sslmode=require en la URL;
-# esto es un respaldo por si tu URL no lo trae.
+# esto es un respaldo por si tu URL no lo trae. Solo aplica a Postgres:
+# SQLite (usado en pruebas locales) no acepta este argumento y rompería.
 connect_args = {}
-if "sslmode" not in DATABASE_URL:
+if DATABASE_URL.startswith("postgresql") and "sslmode" not in DATABASE_URL:
     connect_args = {"sslmode": "require"}
 
 engine = create_engine(

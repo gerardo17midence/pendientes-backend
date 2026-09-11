@@ -1,14 +1,14 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 import google.generativeai as genai
 import json
 import os
 import io
 import datetime
-from pydantic import ValidationError
+from pydantic import ValidationError, BaseModel
 from PIL import Image
 
 from reportlab.lib.pagesizes import letter
@@ -18,9 +18,33 @@ from reportlab.lib import colors
 
 from database import Base, engine, get_db
 from models import Tarea, Habito, HabitoRegistro, DIAS_SEMANA, inicio_semana_actual
-from schemas import VisionResult, TareaOut, HabitoOut, EstadoCompleto
+from schemas import VisionResult, TareaOut, HabitoOut, EstadoCompleto, ProcesarHojaResponse
 
-app = FastAPI()
+EQUIPO = ["GERARDO", "CRIS", "MARIO", "HÉCTOR", "GRACIA", "INGRID", "JULIO"]
+HABITOS_BASE = ["Gimnasio", "Lectura 15 min", "Tenis"]
+
+
+def asegurar_habitos_base(db: Session):
+    """Crea los hábitos base la primera vez que se usa la base de datos."""
+    existentes = {h.nombre for h in db.query(Habito).all()}
+    for nombre in HABITOS_BASE:
+        if nombre not in existentes:
+            db.add(Habito(nombre=nombre))
+    db.commit()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    db = next(get_db())
+    try:
+        asegurar_habitos_base(db)
+    finally:
+        db.close()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,17 +54,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Crea las tablas si no existen (no reemplaza a Alembic para el futuro,
-# pero es suficiente mientras el esquema sea simple)
-Base.metadata.create_all(bind=engine)
-
-# Configuración de clave API de Gemini
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-
-EQUIPO = ["GERARDO", "CRIS", "MARIO", "HÉCTOR", "GRACIA", "INGRID", "JULIO"]
-HABITOS_BASE = ["Gimnasio", "Lectura 15 min", "Tenis"]
 
 PROMPT_ANALISIS = """
 Analiza esta foto de una hoja impresa de pendientes y hábitos.
@@ -72,33 +88,16 @@ sin texto adicional):
 """
 
 
-def asegurar_habitos_base(db: Session):
-    """Crea los hábitos base la primera vez que se usa la base de datos."""
-    existentes = {h.nombre for h in db.query(Habito).all()}
-    for nombre in HABITOS_BASE:
-        if nombre not in existentes:
-            db.add(Habito(nombre=nombre))
-    db.commit()
+def construir_estado(db: Session) -> EstadoCompleto:
+    """Arma el estado completo del tablero (tareas pendientes + hábitos
+    de la semana en curso) directamente desde la base de datos.
 
-
-@app.on_event("startup")
-def startup():
-    db = next(get_db())
-    try:
-        asegurar_habitos_base(db)
-    finally:
-        db.close()
-
-
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "Backend de Pendientes Operativo"}
-
-
-@app.get("/pendientes", response_model=EstadoCompleto)
-def obtener_estado(db: Session = Depends(get_db)):
-    """Estado actual completo: pendientes + hábitos de la semana en curso.
-    Útil para que el frontend cargue el tablero sin necesidad de subir foto."""
+    Esta es la ÚNICA función que arma esta forma de datos — la usan
+    tanto GET /pendientes (carga inicial de la página) como
+    POST /procesar-hoja (después de procesar una foto). Así el
+    frontend siempre pinta desde el mismo contrato, y nunca se puede
+    "perder" una tarea en pantalla por mostrar solo un fragmento.
+    """
     tareas = db.query(Tarea).filter(Tarea.completada == False).order_by(Tarea.fecha_creada).all()  # noqa: E712
 
     lunes = datetime.datetime.combine(inicio_semana_actual(), datetime.time.min)
@@ -124,7 +123,64 @@ def obtener_estado(db: Session = Depends(get_db)):
     )
 
 
-@app.post("/procesar-hoja")
+@app.get("/")
+def home():
+    return {"status": "ok", "message": "Backend de Pendientes Operativo"}
+
+
+@app.get("/pendientes", response_model=EstadoCompleto)
+def obtener_estado(db: Session = Depends(get_db)):
+    """Estado actual completo. Lo llama el frontend al cargar la página."""
+    return construir_estado(db)
+
+
+@app.patch("/tareas/{tarea_id}/completar", response_model=EstadoCompleto)
+def completar_tarea(tarea_id: int, db: Session = Depends(get_db)):
+    """Marca una tarea como completada directamente desde el teléfono,
+    sin necesidad de tomarle foto a la hoja impresa."""
+    tarea = db.query(Tarea).filter(Tarea.id == tarea_id).first()
+    if not tarea:
+        raise HTTPException(status_code=404, detail="Esa tarea no existe.")
+    if tarea.completada:
+        raise HTTPException(status_code=400, detail="Esa tarea ya estaba completada.")
+    tarea.marcar_completada()
+    db.commit()
+    generar_pdf_file(db)
+    return construir_estado(db)
+
+
+class NuevaTareaManual(BaseModel):
+    asignado_a: str
+    categoria: str = "TRABAJO"
+    descripcion: str
+    prioritaria: bool = False
+
+
+@app.post("/tareas", response_model=EstadoCompleto)
+def crear_tarea_manual(nueva: NuevaTareaManual, db: Session = Depends(get_db)):
+    """Agrega una tarea manualmente desde el teléfono, sin necesidad de
+    escribirla a mano en el papel y tomarle foto."""
+    asignado = nueva.asignado_a.strip().upper()
+    if asignado not in EQUIPO:
+        raise HTTPException(status_code=400, detail=f"'{asignado}' no es parte del equipo: {', '.join(EQUIPO)}")
+    categoria = nueva.categoria.strip().upper()
+    if categoria not in {"TRABAJO", "PERSONALES"}:
+        categoria = "TRABAJO"
+    if not nueva.descripcion.strip():
+        raise HTTPException(status_code=400, detail="La descripción no puede estar vacía.")
+
+    db.add(Tarea(
+        asignado_a=asignado,
+        categoria=categoria,
+        descripcion=nueva.descripcion.strip(),
+        prioritaria=nueva.prioritaria,
+    ))
+    db.commit()
+    generar_pdf_file(db)
+    return construir_estado(db)
+
+
+@app.post("/procesar-hoja", response_model=ProcesarHojaResponse)
 async def procesar_hoja(file: UploadFile = File(...), db: Session = Depends(get_db)):
     # 1. Leer y validar la imagen
     try:
@@ -156,14 +212,12 @@ async def procesar_hoja(file: UploadFile = File(...), db: Session = Depends(get_
 
     # 4. Aplicar cambios a la base de datos
     try:
-        # Marcar completadas (solo las que Gemini reportó con confianza razonable)
         ids_confirmados = [c.id for c in resultado.completados if c.confianza >= 0.5]
         if ids_confirmados:
             tareas_a_marcar = db.query(Tarea).filter(Tarea.id.in_(ids_confirmados)).all()
             for t in tareas_a_marcar:
                 t.marcar_completada()
 
-        # Agregar nuevas tareas
         for nt in resultado.nuevas_tareas:
             db.add(Tarea(
                 asignado_a=nt.asignado_a,
@@ -172,12 +226,11 @@ async def procesar_hoja(file: UploadFile = File(...), db: Session = Depends(get_
                 prioritaria=nt.prioritaria,
             ))
 
-        # Actualizar hábitos de la semana en curso
         lunes = datetime.datetime.combine(inicio_semana_actual(), datetime.time.min)
         for nombre_habito, dias in resultado.habitos_marcados.items():
             habito = db.query(Habito).filter(Habito.nombre == nombre_habito).first()
             if not habito:
-                continue  # ignora hábitos que no existen en el catálogo
+                continue
             for dia in dias:
                 registro = db.query(HabitoRegistro).filter(
                     HabitoRegistro.habito_id == habito.id,
@@ -196,10 +249,11 @@ async def procesar_hoja(file: UploadFile = File(...), db: Session = Depends(get_
     try:
         generar_pdf_file(db)
     except Exception as e:
-        # No hacemos rollback: los datos ya se guardaron bien, solo falló el PDF.
         raise HTTPException(status_code=500, detail=f"Los cambios se guardaron pero el PDF falló: {e}")
 
-    return {"status": "success", "data": crudo}
+    # 6. Devolver el ESTADO COMPLETO ya persistido (no solo lo de esta foto)
+    estado = construir_estado(db)
+    return ProcesarHojaResponse(status="success", pendientes=estado.pendientes, habitos=estado.habitos)
 
 
 def generar_pdf_file(db: Session):
@@ -211,7 +265,6 @@ def generar_pdf_file(db: Session):
     title_style = ParagraphStyle('DocTitle', parent=styles['Heading1'], fontSize=16, textColor=colors.HexColor('#1A1A1A'))
     fecha_str = datetime.date.today().strftime("%d.%m.%Y")
 
-    # Página 1: Pendientes
     story.append(Paragraph(f"<b>GERARDO - Pendientes</b><br/><font size=9 color='#666666'>{fecha_str}</font>", title_style))
     story.append(Spacer(1, 15))
 
@@ -232,7 +285,6 @@ def generar_pdf_file(db: Session):
 
     story.append(PageBreak())
 
-    # Página 2: Hábitos (semana en curso)
     story.append(Paragraph("<b>GERARDO - Hábitos</b>", title_style))
     story.append(Spacer(1, 15))
 
